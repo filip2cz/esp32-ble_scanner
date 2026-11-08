@@ -1,14 +1,14 @@
 /*
- * ============================================================================
- * Description: This program acts as a standalone BLE (Bluetooth Low Energy) 
- *              radar. It creates its own Wi-Fi Access Point and hosts a 
- *              web interface that displays real-time data of discovered BLE 
- *              devices in the vicinity, including their MAC address, signal 
- *              strength (RSSI), raw HEX data, and basic type parsing.
- *              Includes decoders for common unencrypted BLE sensors.
- * Target:      ESP32-C3
- * Note:        This code was vibecoded using the Gemini AI model.
- * ============================================================================
+ * =================================================================================
+ * Description:     This program acts as a standalone BLE (Bluetooth Low Energy) 
+ *                  radar. It creates its own Wi-Fi Access Point and hosts a 
+ *                  web interface. It also displays the count of actively decoded
+ *                  sensors on an attached I2C OLED screen using U8g2 library 
+ *                  with a specific portrait offset.
+ * Target:          ESP32-C3
+ * Note:            This code was vibecoded using the Gemini Pro 3.1 model.
+ * Conversation:    https://share.gemini.google/kFOl8hnWSdq7
+ * =================================================================================
  */
 
 #include <WiFi.h>
@@ -17,10 +17,23 @@
 #include <BLEUtils.h>
 #include <BLEScan.h>
 #include <map>
+#include <Wire.h>
+#include <U8g2lib.h>
+
+// I2C pins based on your working configuration
+#define I2C_SDA 5
+#define I2C_SCL 6
+
+// U8g2 setup for portrait rotated screen
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R3, /* reset=*/ U8X8_PIN_NONE);
+
+// Offsets for centering text on the specific 40x72 physical cutout
+#define OFFSET_X 0
+#define OFFSET_Y 32
 
 // AP network configuration
 const char* ssid = "ESP32_Radar";
-const char* password = ""; // Open network for easy access
+const char* password = ""; 
 
 WebServer server(80);
 BLEScan* pBLEScan;
@@ -31,10 +44,10 @@ struct DeviceData {
     int rssi;
     String hexData;
     String parsedInfo;
+    bool isDecodedSensor; 
     unsigned long lastSeen;
 };
 
-// Map to store devices by MAC address
 std::map<String, DeviceData> devices;
 
 // Helper function to convert raw byte array into readable HEX string
@@ -49,52 +62,72 @@ String getHex(uint8_t* data, size_t length) {
     return hex;
 }
 
+// Custom function to draw the sensor count using your specific screen offsets
+void drawSensorCount(int count) {
+    u8g2.clearBuffer();
+    
+    // Top line (Small font) - Title
+    u8g2.setFont(u8g2_font_helvB10_tf);
+    String msg1 = "BLE";
+    int msg1Width = u8g2.getUTF8Width(msg1.c_str());
+    int startX1 = OFFSET_X + ((40 - msg1Width) / 2);
+    if (startX1 < OFFSET_X) startX1 = OFFSET_X; 
+    u8g2.drawUTF8(startX1, OFFSET_Y + 28, msg1.c_str());
+    
+    // Bottom line (Giant font) - The actual number
+    u8g2.setFont(u8g2_font_logisoso24_tf);
+    String msg2 = String(count);
+    int msg2Width = u8g2.getUTF8Width(msg2.c_str());
+    int startX2 = OFFSET_X + ((40 - msg2Width) / 2);
+    if (startX2 < OFFSET_X) startX2 = OFFSET_X;
+    u8g2.drawUTF8(startX2, OFFSET_Y + 64, msg2.c_str());
+    
+    u8g2.sendBuffer();
+}
+
 // Callback class for handling discovered BLE devices
 class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
     void onResult(BLEAdvertisedDevice advertisedDevice) {
         String mac = advertisedDevice.getAddress().toString().c_str();
-        String name = advertisedDevice.haveName() ? advertisedDevice.getName().c_str() : "Neznámé";
+        String name = advertisedDevice.haveName() ? advertisedDevice.getName().c_str() : "Unknown";
         int rssi = advertisedDevice.getRSSI();
 
         String hexData = "-";
-        String parsedInfo = "Neznámé zařízení";
+        String parsedInfo = "Unknown device";
+        bool isDecoded = false; 
 
-        // 1. Check Manufacturer Data (Apple, Microsoft, Ruuvi, Govee)
+        // Check Manufacturer Data
         if (advertisedDevice.haveManufacturerData()) {
             String md = advertisedDevice.getManufacturerData();
             hexData = getHex((uint8_t*)md.c_str(), md.length());
             uint8_t* raw = (uint8_t*)md.c_str();
             
-            // Apple (0x4C 0x00)
             if(md.length() >= 2 && raw[0] == 0x4C && raw[1] == 0x00) {
-                parsedInfo = "🍎 Apple (AirTag/iPhone)";
+                parsedInfo = "Apple (AirTag/iPhone)";
             } 
-            // Microsoft (0x06 0x00)
             else if (md.length() >= 2 && raw[0] == 0x06 && raw[1] == 0x00) {
-                parsedInfo = "🪟 Microsoft";
+                parsedInfo = "Microsoft";
             }
-            // RuuviTag - Manufacturer ID 0x0499 (Little Endian: 0x99 0x04)
             else if (md.length() >= 7 && raw[0] == 0x99 && raw[1] == 0x04) {
-                if (raw[2] == 0x05) { // Data Format 5 (RAWv2)
+                if (raw[2] == 0x05) { 
                     int16_t tempRaw = (raw[3] << 8) | raw[4];
                     float temp = tempRaw * 0.005;
                     uint16_t humRaw = (raw[5] << 8) | raw[6];
                     float hum = humRaw * 0.0025;
-                    parsedInfo = "🦌 RuuviTag: " + String(temp, 1) + " °C, " + String(hum, 1) + " %";
-                } else {
-                    parsedInfo = "🦌 RuuviTag (Starší formát)";
+                    parsedInfo = "Ruuvi: " + String(temp, 1) + " C, " + String(hum, 1) + " %";
+                    isDecoded = true; 
                 }
             }
-            // Govee Thermometers (Often 0x88EC, e.g., H5075)
             else if (md.length() >= 7 && raw[0] == 0x88 && raw[1] == 0xEC) {
                 int rawVal = (raw[3] << 16) | (raw[4] << 8) | raw[5];
                 float temp = (rawVal / 1000) / 10.0;
                 float hum = (rawVal % 1000) / 10.0;
                 uint8_t batt = raw[6];
-                parsedInfo = "💡 Govee: " + String(temp, 1) + " °C, " + String(hum, 1) + " %, 🔋 " + String(batt) + " %";
+                parsedInfo = "Govee: " + String(temp, 1) + " C";
+                isDecoded = true; 
             }
         } 
-        // 2. Check Service Data (Environmental sensors & beacons)
+        // Check Service Data
         else if (advertisedDevice.haveServiceData()) {
             int count = advertisedDevice.getServiceDataCount();
             if (count > 0) {
@@ -103,56 +136,75 @@ class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
                 hexData = getHex((uint8_t*)sd.c_str(), sd.length());
                 uint8_t* raw = (uint8_t*)sd.c_str();
                 
-                // Xiaomi Mijia with ATC1441 custom firmware (UUID 0x181A)
                 if (serviceUUID.equals(BLEUUID((uint16_t)0x181A)) && sd.length() >= 11) {
                     int16_t tempRaw = (raw[6] << 8) | raw[7];
                     float temp = tempRaw / 10.0;
-                    uint8_t hum = raw[8];
-                    uint8_t batt = raw[9];
-                    parsedInfo = "🌡️ Xiaomi ATC: " + String(temp, 1) + " °C, " + String(hum) + " %, 🔋 " + String(batt) + " %";
+                    parsedInfo = "Xiaomi ATC: " + String(temp, 1) + " C";
+                    isDecoded = true; 
                 }
-                // SwitchBot Meter / Thermometer (UUID 0x0FD3)
                 else if (serviceUUID.equals(BLEUUID((uint16_t)0x0FD3)) && sd.length() >= 6) {
-                    uint8_t batt = raw[2] & 0x7F;
                     float temp = ((raw[3] & 0x0F) * 10.0 + (raw[4] & 0x7F)) / 10.0;
-                    if ((raw[4] & 0x80) == 0) temp = -temp; // Sign bit flag
-                    uint8_t hum = raw[5] & 0x7F;
-                    parsedInfo = "🤖 SwitchBot: " + String(temp, 1) + " °C, " + String(hum) + " %, 🔋 " + String(batt) + " %";
+                    if ((raw[4] & 0x80) == 0) temp = -temp; 
+                    parsedInfo = "SwitchBot: " + String(temp, 1) + " C";
+                    isDecoded = true; 
                 }
-                // Qingping / ClearGrass Sensors (UUID 0xFDCD)
                 else if (serviceUUID.equals(BLEUUID((uint16_t)0xFDCD))) {
-                    parsedInfo = "🌱 Qingping Senzor";
+                    parsedInfo = "Qingping Sensor";
+                    isDecoded = true;
                 }
-                // Inkbird BBQ Thermometers (UUID 0xFFF0)
                 else if (serviceUUID.equals(BLEUUID((uint16_t)0xFFF0))) {
-                    parsedInfo = "🥩 Inkbird BBQ Teploměr";
+                    parsedInfo = "Inkbird BBQ";
+                    isDecoded = true;
                 }
-                // BTHome Standard (UUID 0xFCD2)
                 else if (serviceUUID.equals(BLEUUID((uint16_t)0xFCD2))) {
-                    parsedInfo = "🏠 BTHome Smart Sensor";
+                    parsedInfo = "BTHome Sensor";
+                    isDecoded = true;
                 }
-                // Xiaomi MiBeacon Original (UUID 0xFE95)
                 else if (serviceUUID.equals(BLEUUID((uint16_t)0xFE95))) {
-                    parsedInfo = "🇨🇳 Xiaomi MiBeacon (šifrováno)";
+                    parsedInfo = "Xiaomi MiBeacon (Encrypted)";
                 } 
-                // Generic fallback for unknown UUIDs
                 else {
-                    parsedInfo = "Senzor (UUID: " + String(serviceUUID.toString().c_str()).substring(4,8) + ")";
+                    parsedInfo = "Sensor (UUID: " + String(serviceUUID.toString().c_str()).substring(4,8) + ")";
                 }
             }
         }
 
-        // Store or update device in map
+        // Store device
         DeviceData d;
         d.name = name;
         d.rssi = rssi;
         d.hexData = hexData;
         d.parsedInfo = parsedInfo;
+        d.isDecodedSensor = isDecoded; 
         d.lastSeen = millis();
         
         devices[mac] = d;
     }
 };
+
+// Periodic cleanup and OLED update
+void updateOLEDAndCleanup() {
+    unsigned long now = millis();
+    int targetSensorsCount = 0;
+    
+    for (auto it = devices.begin(); it != devices.end(); ) {
+        if (now - it->second.lastSeen > 15000) {
+            it = devices.erase(it); 
+        } else {
+            if (it->second.isDecodedSensor) {
+                targetSensorsCount++;
+            }
+            ++it;
+        }
+    }
+    
+    // Update display only if count changed to prevent flicker
+    static int lastCount = -1;
+    if (targetSensorsCount != lastCount) {
+        drawSensorCount(targetSensorsCount);
+        lastCount = targetSensorsCount;
+    }
+}
 
 // Handle root URL "/"
 void handleRoot() {
@@ -189,35 +241,27 @@ void handleRoot() {
 // Handle "/data" URL
 void handleData() {
     String rows = "";
-    unsigned long now = millis();
     
-    for (auto it = devices.begin(); it != devices.end(); ) {
-        if (now - it->second.lastSeen > 15000) {
-            it = devices.erase(it); 
+    for (auto it = devices.begin(); it != devices.end(); ++it) {
+        rows += "<tr>";
+        rows += "<td><strong>" + it->first + "</strong><br><small style='color: #aaa;'>" + it->second.name + "</small></td>";
+        
+        String bars = "";
+        String color = "";
+        if(it->second.rssi > -60) {
+            color = "#00ffcc"; bars = "▂▃▅▆▇";
+        } else if (it->second.rssi > -75) {
+            color = "#ffcc00"; bars = "▂▃▅--";
+        } else if (it->second.rssi > -85) {
+            color = "#ff8800"; bars = "▂▃---";
         } else {
-            rows += "<tr>";
-            
-            rows += "<td><strong>" + it->first + "</strong><br><small style='color: #aaa;'>" + it->second.name + "</small></td>";
-            
-            String bars = "";
-            String color = "";
-            if(it->second.rssi > -60) {
-                color = "#00ffcc"; bars = "▂▃▅▆▇";
-            } else if (it->second.rssi > -75) {
-                color = "#ffcc00"; bars = "▂▃▅--";
-            } else if (it->second.rssi > -85) {
-                color = "#ff8800"; bars = "▂▃---";
-            } else {
-                color = "#ff4444"; bars = "▂----";
-            }
-            
-            rows += "<td style='color: " + color + ";'><span class='bars'>" + bars + "</span><br><small>" + String(it->second.rssi) + " dBm</small></td>";
-            
-            rows += "<td>" + it->second.parsedInfo + "</td>";
-            rows += "<td class='hex'>" + it->second.hexData + "</td>";
-            rows += "</tr>";
-            ++it;
+            color = "#ff4444"; bars = "▂----";
         }
+        
+        rows += "<td style='color: " + color + ";'><span class='bars'>" + bars + "</span><br><small>" + String(it->second.rssi) + " dBm</small></td>";
+        rows += "<td>" + it->second.parsedInfo + "</td>";
+        rows += "<td class='hex'>" + it->second.hexData + "</td>";
+        rows += "</tr>";
     }
     
     server.send(200, "text/html", rows);
@@ -225,6 +269,17 @@ void handleData() {
 
 void setup() {
     Serial.begin(115200);
+    
+    // Initialize I2C and U8g2 Display
+    Wire.begin(I2C_SDA, I2C_SCL);
+    u8g2.begin();
+    u8g2.enableUTF8Print(); 
+    
+    // Initial loading screen
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_helvB10_tf);
+    u8g2.drawUTF8(OFFSET_X + 5, OFFSET_Y + 40, "Start");
+    u8g2.sendBuffer();
     
     WiFi.softAP(ssid, password);
     WiFi.setSleep(false); 
@@ -249,4 +304,6 @@ void loop() {
     server.handleClient();
     pBLEScan->start(1, false); 
     pBLEScan->clearResults(); 
+    
+    updateOLEDAndCleanup();
 }
